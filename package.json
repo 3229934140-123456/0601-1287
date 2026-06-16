@@ -1,0 +1,14 @@
+{
+  "name": "shipyard-platform",
+  "version": "1.0.0",
+  "description": "船舶制造项目全生命周期协同管理平台",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "uuid": "^10.0.0"
+  }
+}
