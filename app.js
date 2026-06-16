@@ -126,20 +126,56 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/material/stock-in/apply', (req, res) => {
-  const { material_code, supplier_code, apply_quantity, certificate_no, certificate_valid_date } = req.body;
+  const {
+    material_code, material_type, material_name,
+    supplier_code, supplier_name, qualification_valid_date, qualification_level,
+    apply_quantity, certificate_no, certificate_valid_date,
+  } = req.body;
 
-  if (!material_code || !supplier_code || !apply_quantity) {
-    return res.json(fail('物料编码、供应商编码和申请数量不能为空'));
+  const fieldErrors = [];
+  if (!apply_quantity || apply_quantity <= 0) fieldErrors.push('apply_quantity: 申请数量必须大于0');
+  if (!material_code && !material_type) fieldErrors.push('material_code 或 material_type: 至少提供一个来标识物料');
+  if (!supplier_code && !supplier_name) fieldErrors.push('supplier_code 或 supplier_name: 至少提供一个来标识供应商');
+
+  if (fieldErrors.length > 0) {
+    return res.json(fail(`字段校验失败: ${fieldErrors.join('; ')}`));
   }
 
-  const material = materials.find(m => m.material_code === material_code);
-  if (!material) {
-    return res.json(fail(`物料编码不存在: ${material_code}`));
+  let material;
+  if (material_code) {
+    material = materials.find(m => m.material_code === material_code);
+    if (!material) return res.json(fail(`物料编码不存在: ${material_code}`));
+  } else {
+    const candidates = materials.filter(m => m.material_type === material_type);
+    if (candidates.length === 0) return res.json(fail(`物料类型不存在: ${material_type}`));
+    if (material_name) {
+      material = candidates.find(m => m.material_name === material_name);
+      if (!material) return res.json(fail(`未找到类型为"${material_type}"、名称为"${material_name}"的物料`));
+    } else {
+      material = candidates[0];
+    }
   }
 
-  const supplier = suppliers.find(s => s.supplier_code === supplier_code);
-  if (!supplier) {
-    return res.json(fail(`供应商编码不存在: ${supplier_code}`));
+  let supplier;
+  if (supplier_code) {
+    supplier = suppliers.find(s => s.supplier_code === supplier_code);
+    if (!supplier) return res.json(fail(`供应商编码不存在: ${supplier_code}`));
+  } else {
+    const candidates = suppliers.filter(s => s.supplier_name === supplier_name);
+    if (candidates.length === 0) return res.json(fail(`供应商名称不存在: ${supplier_name}`));
+    if (qualification_valid_date) {
+      supplier = candidates.find(s => s.qualification_valid_date === qualification_valid_date);
+      if (!supplier) supplier = candidates[0];
+    } else {
+      supplier = candidates[0];
+    }
+  }
+
+  if (qualification_valid_date) {
+    supplier.qualification_valid_date = qualification_valid_date;
+  }
+  if (qualification_level) {
+    supplier.qualification_level = qualification_level;
   }
 
   const rejectReasons = [];
@@ -158,10 +194,12 @@ app.post('/api/material/stock-in/apply', (req, res) => {
   }
 
   const availableStock = material.stock_limit - material.current_stock;
-  const recommendQuantity = Math.min(apply_quantity, Math.max(availableStock, 0));
 
-  if (availableStock <= 0) {
-    rejectReasons.push(`库存已达上限，当前库存: ${material.current_stock}，上限: ${material.stock_limit}`);
+  if (apply_quantity > availableStock) {
+    const excess = apply_quantity - availableStock;
+    rejectReasons.push(
+      `申请量超出剩余库存: 申请${apply_quantity}, 剩余可入${availableStock}, 当前库存${material.current_stock}, 上限${material.stock_limit}, 超出${excess}`
+    );
   }
 
   const applyNo = generateApplyNo();
@@ -171,17 +209,19 @@ app.post('/api/material/stock-in/apply', (req, res) => {
     material_id: material.id,
     material_code: material.material_code,
     material_name: material.material_name,
+    material_type: material.material_type,
     supplier_id: supplier.id,
     supplier_code: supplier.supplier_code,
     supplier_name: supplier.supplier_name,
     apply_quantity,
-    recommend_quantity: rejectReasons.length > 0 ? 0 : recommendQuantity,
+    recommend_quantity: rejectReasons.length > 0 ? 0 : apply_quantity,
     certificate_no: certificate_no || null,
     certificate_valid_date: certificate_valid_date || null,
     status: rejectReasons.length > 0 ? 'REJECTED' : 'APPROVED',
     reject_reason: rejectReasons.length > 0 ? rejectReasons.join('; ') : null,
     current_stock: material.current_stock,
     stock_limit: material.stock_limit,
+    available_stock: availableStock,
     create_time: new Date().toISOString(),
   };
 
@@ -191,7 +231,7 @@ app.post('/api/material/stock-in/apply', (req, res) => {
     return res.json(fail(rejectReasons.join('; '), 400, applyRecord));
   }
 
-  material.current_stock += recommendQuantity;
+  material.current_stock += apply_quantity;
 
   return res.json(ok(applyRecord, '入库申请审核通过'));
 });
@@ -205,7 +245,7 @@ app.get('/api/material/stock-in/apply/:applyNo', (req, res) => {
 });
 
 app.post('/api/scheduling/generate', (req, res) => {
-  const { project_no, section_code, plan_start_time, resource_ids, material_arrival_time, process_ids } = req.body;
+  const { project_no, section_code, plan_start_time, resource_ids, material_arrival_time, process_ids, equipment_occupied } = req.body;
 
   if (!project_no || !section_code || !plan_start_time || !resource_ids || resource_ids.length === 0) {
     return res.json(fail('项目号、分段编码、计划开始时间和车间资源列表不能为空'));
@@ -233,6 +273,22 @@ app.post('/api/scheduling/generate', (req, res) => {
     resourceOccupied[r.id] = buildSchedules
       .filter(s => s.resource_id === r.id && s.locked)
       .sort((a, b) => new Date(a.plan_start_time) - new Date(b.plan_start_time));
+  }
+
+  if (equipment_occupied && Array.isArray(equipment_occupied)) {
+    for (const occ of equipment_occupied) {
+      const rid = occ.resource_id;
+      if (resourceOccupied[rid]) {
+        resourceOccupied[rid].push({
+          resource_id: rid,
+          plan_start_time: occ.start_time,
+          plan_end_time: occ.end_time,
+          source: 'external',
+          occupied_reason: occ.reason || '外部占用',
+        });
+        resourceOccupied[rid].sort((a, b) => new Date(a.plan_start_time) - new Date(b.plan_start_time));
+      }
+    }
   }
 
   const scheduleNo = generateScheduleNo();
@@ -343,13 +399,22 @@ app.post('/api/scheduling/generate', (req, res) => {
 
   const lockedResources = requestedResources
     .filter(r => r.locked)
-    .map(r => ({
-      resource_id: r.id,
-      resource_code: r.resource_code,
-      resource_name: r.resource_name,
-      resource_type: r.resource_type,
-      workshop: r.workshop,
-    }));
+    .map(r => {
+      const entry = {
+        resource_id: r.id,
+        resource_code: r.resource_code,
+        resource_name: r.resource_name,
+        resource_type: r.resource_type,
+        workshop: r.workshop,
+      };
+      const externalOcc = (equipment_occupied || []).find(o => o.resource_id === r.id);
+      if (externalOcc) {
+        entry.occupied = true;
+        entry.occupied_time_range = `${externalOcc.start_time} ~ ${externalOcc.end_time}`;
+        entry.occupied_reason = externalOcc.reason || '外部占用';
+      }
+      return entry;
+    });
 
   const message = hasConflict
     ? '排程完成，存在资源冲突，已自动调整并锁定资源'
@@ -527,20 +592,47 @@ app.get('/api/report/daily', (req, res) => {
   }
 
   const projectSections = sections.filter(s => s.project_no === project_no);
+  const projectExists = sections.some(s => s.project_no === project_no);
 
   const dayStart = new Date(report_date + 'T00:00:00');
   const dayEnd = new Date(report_date + 'T23:59:59');
+
+  const dayInspections = inspectionRecords.filter(r =>
+    r.project_no === project_no &&
+    new Date(r.inspect_time) >= dayStart &&
+    new Date(r.inspect_time) <= dayEnd
+  );
+  const hasDayData = dayInspections.length > 0;
+
+  if (!projectExists || !hasDayData) {
+    const emptyReason = !projectExists
+      ? `项目号 ${project_no} 不存在`
+      : `项目 ${project_no} 在 ${report_date} 当天无任何数据`;
+
+    return res.json(ok({
+      project_no,
+      report_date,
+      has_data: false,
+      empty_reason: emptyReason,
+      section_count: 0,
+      avg_completion_rate: 0,
+      overall_first_pass_rate: 0,
+      total_inspections: 0,
+      first_pass_count: 0,
+      equipment_count: 0,
+      fault_equipment_count: 0,
+      total_fault_count: 0,
+      equipment_fault_rate: 0,
+      section_stats: [],
+      equipment_stats: [],
+    }));
+  }
 
   const sectionStats = [];
   let totalCompletion = 0;
 
   for (const sec of projectSections) {
-    const secInspections = inspectionRecords.filter(r =>
-      r.project_no === project_no &&
-      r.section_id === sec.id &&
-      new Date(r.inspect_time) >= dayStart &&
-      new Date(r.inspect_time) <= dayEnd
-    );
+    const secInspections = dayInspections.filter(r => r.section_id === sec.id);
     const totalInspect = secInspections.length;
     const firstPassCount = secInspections.filter(r => r.first_pass).length;
     const firstPassRate = totalInspect > 0 ? Math.round((firstPassCount / totalInspect) * 10000) / 100 : 0;
@@ -563,13 +655,8 @@ app.get('/api/report/daily', (req, res) => {
     ? Math.round((totalCompletion / projectSections.length) * 100) / 100
     : 0;
 
-  const allProjectInspections = inspectionRecords.filter(r =>
-    r.project_no === project_no &&
-    new Date(r.inspect_time) >= dayStart &&
-    new Date(r.inspect_time) <= dayEnd
-  );
-  const totalInspectAll = allProjectInspections.length;
-  const firstPassAll = allProjectInspections.filter(r => r.first_pass).length;
+  const totalInspectAll = dayInspections.length;
+  const firstPassAll = dayInspections.filter(r => r.first_pass).length;
   const overallFirstPassRate = totalInspectAll > 0
     ? Math.round((firstPassAll / totalInspectAll) * 10000) / 100
     : 0;
@@ -589,12 +676,10 @@ app.get('/api/report/daily', (req, res) => {
     fault_count: e.fault_count,
   }));
 
-  const hasData = projectSections.length > 0 || totalEquipment > 0;
-
-  const result = {
+  return res.json(ok({
     project_no,
     report_date,
-    has_data: hasData,
+    has_data: true,
     section_count: projectSections.length,
     avg_completion_rate: avgCompletionRate,
     overall_first_pass_rate: overallFirstPassRate,
@@ -606,13 +691,7 @@ app.get('/api/report/daily', (req, res) => {
     equipment_fault_rate: equipmentFaultRate,
     section_stats: sectionStats,
     equipment_stats: equipmentStats,
-  };
-
-  if (projectSections.length === 0) {
-    result.empty_reason = '该项目下暂无分段数据';
-  }
-
-  return res.json(ok(result));
+  }));
 });
 
 app.get('/api/report/sections/completion', (req, res) => {
